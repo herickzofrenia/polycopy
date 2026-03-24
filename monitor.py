@@ -44,6 +44,9 @@ class WalletMonitor:
         # Status por wallet (para dashboard)
         self._wallet_status = {}
         self._status_lock = threading.Lock()
+        # Cache de bankroll das wallets alvo: {address: {"bankroll": float, "updated": float}}
+        self._bankroll_cache = {}
+        self._bankroll_ttl = 60  # atualizar a cada 60s
 
     def start(self):
         """Inicia uma thread de polling pra cada wallet."""
@@ -238,6 +241,22 @@ class WalletMonitor:
         if not condition_id:
             condition_id = token_id
 
+        # usdcSize do trade original (quanto o trader gastou em USDC)
+        original_usdc = 0.0
+        for field in ("usdcSize", "usdc_size"):
+            val = trade.get(field)
+            if val is not None:
+                try:
+                    original_usdc = abs(float(val))
+                    break
+                except (ValueError, TypeError):
+                    pass
+        if original_usdc == 0 and price > 0 and size > 0:
+            original_usdc = price * size
+
+        # Buscar bankroll do trader (pra modo PERCENT)
+        trader_bankroll = self._get_trader_bankroll(wallet_cfg["address"])
+
         trade_data = {
             "token_id": token_id,
             "condition_id": condition_id,
@@ -249,6 +268,9 @@ class WalletMonitor:
             "wallet_source": label,
             "transaction_hash": tx_hash,
             "max_market_usdc": wallet_cfg.get("max_market_usdc", 999999),
+            "price_max": wallet_cfg.get("price_max", 0.99),
+            "original_usdc": original_usdc,
+            "trader_bankroll": trader_bankroll,
         }
 
         result = self.executor.execute_copy_trade(trade_data)
@@ -256,6 +278,34 @@ class WalletMonitor:
             log.info("[%s] Copy trade executado: %s", label, result.get("order_id", "?"))
         else:
             log.warning("[%s] Copy trade falhou ou foi pulado", label)
+
+    def _get_trader_bankroll(self, address):
+        """Busca portfolio value da wallet alvo via Data API (com cache)."""
+        now = time.time()
+        cached = self._bankroll_cache.get(address)
+        if cached and (now - cached["updated"]) < self._bankroll_ttl:
+            return cached["bankroll"]
+
+        bankroll = 0.0
+        try:
+            # Tenta buscar posicoes e somar currentValue + saldo disponivel
+            url = f"{config.DATA_API_URL}/positions?user={address}&sizeThreshold=0.1&limit=100"
+            resp = requests.get(url, timeout=10)
+            if resp.status_code == 200:
+                positions = resp.json()
+                if isinstance(positions, list):
+                    total_value = sum(float(p.get("currentValue", 0)) for p in positions)
+                    bankroll = total_value
+        except Exception:
+            pass
+
+        # Fallback conservador se nao conseguiu
+        if bankroll < 1:
+            bankroll = 1000.0  # estimativa default
+
+        self._bankroll_cache[address] = {"bankroll": bankroll, "updated": now}
+        log.debug("Bankroll de %s: $%.2f", address[:16], bankroll)
+        return bankroll
 
     def _extract_side(self, trade):
         """Extrai o side (BUY/SELL) do trade."""

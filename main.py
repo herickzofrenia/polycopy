@@ -78,13 +78,24 @@ def main():
     executor = OrderExecutor(tracker)
     monitor = WalletMonitor(executor, tracker)
 
+    # WebSocket monitor (deteccao rapida via RTDS)
+    from ws_monitor import WSTradeMonitor
+    ws_monitor = WSTradeMonitor(executor, tracker, monitor.dedup)
+    ws_monitor.start()
+
+    # Auto-redeemer
+    from redeemer import AutoRedeemer
+    redeemer = AutoRedeemer()
+    if not config.DRY_RUN:
+        redeemer.start()
+
     # Dashboard
     no_dash = "--no-dash" in sys.argv
     if not no_dash:
         start_dashboard_thread(monitor, tracker)
         log.info("Dashboard disponivel em http://localhost:%d", config.DASHBOARD_PORT)
 
-    # Iniciar monitor
+    # Iniciar monitor HTTP (backup do WebSocket)
     monitor.start()
 
     # Graceful shutdown
@@ -95,6 +106,7 @@ def main():
         if not stop_event:
             stop_event = True
             log.info("Sinal recebido, encerrando...")
+            ws_monitor.stop()
             monitor.stop()
 
     signal.signal(signal.SIGINT, handle_signal)

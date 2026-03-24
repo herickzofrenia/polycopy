@@ -101,19 +101,74 @@ class OrderExecutor:
         wallet = trade_data.get("wallet_source", "")
         condition_id = trade_data.get("condition_id", token_id)
         max_market_usdc = trade_data.get("max_market_usdc", 999999)
+        price_max = trade_data.get("price_max", 0.99)
 
-        # Calcular preco com slippage
+        log.info(
+            "MAX_MKT CHECK: wallet=%s condition=%s market=%s already_spent=%.2f max=%.2f",
+            wallet, condition_id[:20] if condition_id else "?",
+            market[:30] if market else "?",
+            self.tracker.get_market_spend(wallet, condition_id),
+            max_market_usdc,
+        )
+
+        # Calcular preco com slippage, limitado pelo price_max da wallet
         if side == "BUY":
-            copy_price = min(round(original_price * (1 + config.MAX_SLIPPAGE_PCT / 100), 4), 0.99)
+            copy_price = min(
+                round(original_price * (1 + config.MAX_SLIPPAGE_PCT / 100), 4),
+                price_max,  # nunca acima do price_max da wallet
+                0.99,
+            )
         else:
             copy_price = max(round(original_price * (1 - config.MAX_SLIPPAGE_PCT / 100), 4), 0.01)
 
-        # Calcular size em shares
+        # Calcular size em shares baseado no modo de copia
         if side == "BUY":
-            # Garantir que o notional (size * price) >= $1.05 (Polymarket min = $1)
-            min_notional = max(config.COPY_SIZE_USDC, 1.05)
-            copy_size = round(min_notional / copy_price, 2)
-            # Verificacao final: se apos arredondamento o notional caiu abaixo de $1, ajustar
+            original_size = trade_data.get("size", 0)
+            original_usdc = original_price * original_size
+
+            if config.COPY_MODE == "PERCENT":
+                # Calcular % que o trader usou
+                # usdcSize do trade / banca estimada do trader
+                # Como nao sabemos a banca exata, usamos o valor do trade
+                # e aplicamos a mesma proporcao relativa na nossa banca
+                # Ex: trader gastou $5 num trade, sua banca e $50
+                # Se minha banca e $100 e mult=1.0: gasto $10
+                if original_usdc > 0 and config.MY_BANKROLL > 0:
+                    # Proporcao direta: (trade_usdc / minha_banca) * multiplicador
+                    # Mas o que queremos e: mesma % relativa
+                    # Se trader gastou $5 com banca de ~$500, usou 1%
+                    # Na minha banca de $50 com mult 1.0 = $0.50
+                    # Precisamos estimar a banca do trader
+                    # Heuristica: buscar do trade_data ou usar estimativa
+                    trader_banca = trade_data.get("trader_bankroll", 0)
+                    if trader_banca <= 0:
+                        # Estimar banca do trader pelo usdcSize do trade
+                        # Se ele fez trade de $5, estimamos banca de ~$500 (1%)
+                        # Melhor: usar o original_usdc direto como referencia
+                        # my_usdc = (original_usdc / original_usdc) * MY_BANKROLL * mult
+                        # Simplificado: copiar o mesmo valor proporcional
+                        my_usdc = original_usdc * config.COPY_MULTIPLIER
+                    else:
+                        pct_used = original_usdc / trader_banca
+                        my_usdc = config.MY_BANKROLL * pct_used * config.COPY_MULTIPLIER
+
+                    my_usdc = max(my_usdc, 1.05)  # minimo $1.05
+                    copy_size = round(my_usdc / copy_price, 2)
+                    log.info(
+                        "Modo PERCENT: trade=$%.2f | mult=%.2fx | meu_trade=$%.2f",
+                        original_usdc, config.COPY_MULTIPLIER, my_usdc
+                    )
+                else:
+                    # Fallback pra FIXED
+                    fixed_usdc = max(config.COPY_SIZE_USDC * config.COPY_MULTIPLIER, 1.05)
+                    copy_size = round(fixed_usdc / copy_price, 2)
+            else:
+                # Modo FIXED: valor fixo com multiplicador
+                fixed_usdc = config.COPY_SIZE_USDC * config.COPY_MULTIPLIER
+                min_notional = max(fixed_usdc, 1.05)
+                copy_size = round(min_notional / copy_price, 2)
+
+            # Garantir notional minimo de $1
             while copy_size * copy_price < 1.0:
                 copy_size += 0.01
             copy_size = round(copy_size, 2)
@@ -123,7 +178,8 @@ class OrderExecutor:
             if open_pos and open_pos["size"] > 0:
                 copy_size = round(open_pos["size"], 2)
             else:
-                min_notional = max(config.COPY_SIZE_USDC, 1.05)
+                fixed_usdc = config.COPY_SIZE_USDC * config.COPY_MULTIPLIER
+                min_notional = max(fixed_usdc, 1.05)
                 copy_size = round(min_notional / copy_price, 2)
 
         if copy_size < 0.1:
@@ -137,32 +193,17 @@ class OrderExecutor:
             self.tracker.record_skip()
             return None
 
-        # Checar limite de gasto por mercado (max_market_usdc)
+        # Checar limite de gasto por mercado (max_market_usdc) - check inicial
+        # Nota: sera revalidado depois do ajuste de min_size
         if side == "BUY":
             already_spent = self.tracker.get_market_spend(wallet, condition_id)
-            usdc_this_trade = copy_size * copy_price
-            if already_spent + usdc_this_trade > max_market_usdc:
-                remaining = max_market_usdc - already_spent
-                if remaining < 0.10:
-                    log.info(
-                        "Limite de mercado atingido para %s (gasto=%.2f, max=%.2f), pulando BUY",
-                        wallet, already_spent, max_market_usdc
-                    )
-                    self.tracker.record_skip()
-                    return None
-                # Reduzir size pra caber no limite
-                copy_size = round(remaining / copy_price, 2)
-                if copy_size < 0.1:
-                    log.info(
-                        "Limite de mercado quase atingido para %s (resto=%.2f), pulando BUY",
-                        wallet, remaining
-                    )
-                    self.tracker.record_skip()
-                    return None
+            if already_spent >= max_market_usdc:
                 log.info(
-                    "Ajustando size de %.2f pra %.2f (limite mercado %.2f, gasto=%.2f)",
-                    config.COPY_SIZE_USDC / copy_price, copy_size, max_market_usdc, already_spent
+                    "Limite de mercado atingido para %s (gasto=%.2f, max=%.2f), pulando BUY",
+                    wallet, already_spent, max_market_usdc
                 )
+                self.tracker.record_skip()
+                return None
 
         log.info(
             "Executando %s: %s | preco=%.4f | size=%.2f | token=%s",
@@ -203,23 +244,86 @@ class OrderExecutor:
         try:
             clob_side = BUY if side == "BUY" else SELL
 
-            # Buscar min_size do mercado pra evitar rejeicao
-            min_size = self._get_min_size(token_id)
-            if copy_size < min_size:
-                log.info(
-                    "Size %.2f abaixo do minimo do mercado (%.2f), ajustando",
-                    copy_size, min_size
-                )
-                copy_size = min_size
+            # Usar min_size do cache se ja conhecido
+            cached_min = self._min_size_cache.get(token_id, 0)
+            if cached_min > copy_size:
+                copy_size = cached_min
+                log.info("Ajustando size para min cached: %.2f", copy_size)
 
-            order_args = OrderArgs(
-                price=copy_price,
-                size=copy_size,
-                side=clob_side,
-                token_id=token_id,
-            )
-            signed_order = self.client.create_order(order_args)
-            resp = self.client.post_order(signed_order, OrderType.GTC)
+            # REVALIDAR max_market depois do ajuste de min_size
+            if side == "BUY":
+                real_cost = copy_size * copy_price
+                already_spent = self.tracker.get_market_spend(wallet, condition_id)
+                if already_spent + real_cost > max_market_usdc:
+                    remaining = max_market_usdc - already_spent
+                    log.info(
+                        "Limite de mercado estourado apos min_size (custo=%.2f, gasto=%.2f, max=%.2f, rest=%.2f), pulando",
+                        real_cost, already_spent, max_market_usdc, remaining
+                    )
+                    self.tracker.record_skip()
+                    return None
+
+            # Tentar postar - se min size erro, parsear e retry uma vez
+            for attempt in range(2):
+                order_args = OrderArgs(
+                    price=copy_price,
+                    size=copy_size,
+                    side=clob_side,
+                    token_id=token_id,
+                )
+                signed_order = self.client.create_order(order_args)
+
+                try:
+                    resp = self.client.post_order(signed_order, OrderType.GTC)
+                    break  # sucesso
+                except Exception as post_err:
+                    err_msg = str(post_err)
+                    # Parsear min size do erro: "Size (1.18) lower than the minimum: 5"
+                    if "lower than the minimum" in err_msg and attempt == 0:
+                        import re
+                        match = re.search(r"minimum:\s*(\d+\.?\d*)", err_msg)
+                        if match:
+                            min_size = float(match.group(1))
+                            self._min_size_cache[token_id] = min_size
+                            copy_size = min_size
+                            # Revalidar max_market com novo size
+                            new_cost = copy_size * copy_price
+                            spent = self.tracker.get_market_spend(wallet, condition_id)
+                            if side == "BUY" and spent + new_cost > max_market_usdc:
+                                log.info(
+                                    "Min size=%.0f custaria $%.2f, estoura limite (gasto=%.2f max=%.2f), pulando",
+                                    min_size, new_cost, spent, max_market_usdc
+                                )
+                                self.tracker.record_skip()
+                                return None
+                            log.info(
+                                "Min size do mercado = %.2f, retentando com size ajustado",
+                                min_size
+                            )
+                            continue
+                    # Parsear min notional: "min size: $1"
+                    if "min size:" in err_msg and attempt == 0:
+                        import re
+                        match = re.search(r"min size:\s*\$?(\d+\.?\d*)", err_msg)
+                        if match:
+                            min_notional = float(match.group(1))
+                            copy_size = round(min_notional / copy_price + 0.1, 2)
+                            # Revalidar max_market
+                            new_cost = copy_size * copy_price
+                            spent = self.tracker.get_market_spend(wallet, condition_id)
+                            if side == "BUY" and spent + new_cost > max_market_usdc:
+                                log.info(
+                                    "Min notional ajuste custaria $%.2f, estoura limite, pulando",
+                                    new_cost
+                                )
+                                self.tracker.record_skip()
+                                return None
+                            log.info(
+                                "Min notional = $%.2f, retentando com size %.2f",
+                                min_notional, copy_size
+                            )
+                            continue
+                    raise  # re-raise se nao e min size ou ja tentou
 
             order_id = ""
             if isinstance(resp, dict):
