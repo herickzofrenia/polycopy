@@ -10,7 +10,7 @@ log = logging.getLogger("polycopy.executor")
 # Importa py-clob-client (pode falhar se nao instalado)
 try:
     from py_clob_client.client import ClobClient
-    from py_clob_client.clob_types import OrderArgs, OrderType
+    from py_clob_client.clob_types import OrderArgs, MarketOrderArgs, OrderType
     from py_clob_client.order_builder.constants import BUY, SELL
     HAS_CLOB = True
 except ImportError:
@@ -242,6 +242,7 @@ class OrderExecutor:
             return None
 
         try:
+            import re
             clob_side = BUY if side == "BUY" else SELL
 
             # Usar min_size do cache se ja conhecido
@@ -263,67 +264,106 @@ class OrderExecutor:
                     self.tracker.record_skip()
                     return None
 
-            # Tentar postar - se min size erro, parsear e retry uma vez
-            for attempt in range(2):
-                order_args = OrderArgs(
-                    price=copy_price,
-                    size=copy_size,
-                    side=clob_side,
-                    token_id=token_id,
-                )
-                signed_order = self.client.create_order(order_args)
+            # Calcular USDC amount pra market order
+            usdc_amount = round(copy_size * copy_price, 2)
+            usdc_amount = max(usdc_amount, 1.05)
 
+            resp = None
+            order_type_used = "FOK"
+
+            # ESTRATEGIA 1: FOK Market Order (executa no preco de mercado ou cancela)
+            # Melhor pra mercados de 5 minutos - nao fica pendurado no book
+            try:
+                log.info("[FOK] Tentando market order: %s $%.2f em %s", side, usdc_amount, token_id[:16] + "...")
+                market_args = MarketOrderArgs(
+                    token_id=token_id,
+                    amount=usdc_amount,
+                    side=clob_side,
+                )
+                signed_market = self.client.create_market_order(market_args)
+                resp = self.client.post_order(signed_market, OrderType.FOK)
+                log.info("[FOK] Market order executada com sucesso")
+            except Exception as fok_err:
+                fok_msg = str(fok_err)
+                log.warning("[FOK] Falhou: %s", fok_msg[:100])
+
+                # Se min size erro, parsear e tentar GTC
+                if "lower than the minimum" in fok_msg:
+                    match = re.search(r"minimum:\s*(\d+\.?\d*)", fok_msg)
+                    if match:
+                        min_size = float(match.group(1))
+                        self._min_size_cache[token_id] = min_size
+                        copy_size = min_size
+                        usdc_amount = round(copy_size * copy_price, 2)
+                        # Revalidar max_market
+                        spent = self.tracker.get_market_spend(wallet, condition_id)
+                        if side == "BUY" and spent + usdc_amount > max_market_usdc:
+                            log.info("Min size=%.0f estoura limite, pulando", min_size)
+                            self.tracker.record_skip()
+                            return None
+
+                # ESTRATEGIA 2: GTC Limit Order (fallback)
                 try:
+                    log.info("[GTC] Fallback limit order: %s %.2f @ %.4f", side, copy_size, copy_price)
+                    order_args = OrderArgs(
+                        price=copy_price,
+                        size=copy_size,
+                        side=clob_side,
+                        token_id=token_id,
+                    )
+                    signed_order = self.client.create_order(order_args)
                     resp = self.client.post_order(signed_order, OrderType.GTC)
-                    break  # sucesso
-                except Exception as post_err:
-                    err_msg = str(post_err)
-                    # Parsear min size do erro: "Size (1.18) lower than the minimum: 5"
-                    if "lower than the minimum" in err_msg and attempt == 0:
-                        import re
-                        match = re.search(r"minimum:\s*(\d+\.?\d*)", err_msg)
+                    order_type_used = "GTC"
+                    log.info("[GTC] Limit order postada")
+                except Exception as gtc_err:
+                    gtc_msg = str(gtc_err)
+                    # Parsear min size e retry
+                    if "lower than the minimum" in gtc_msg:
+                        match = re.search(r"minimum:\s*(\d+\.?\d*)", gtc_msg)
                         if match:
                             min_size = float(match.group(1))
                             self._min_size_cache[token_id] = min_size
                             copy_size = min_size
-                            # Revalidar max_market com novo size
-                            new_cost = copy_size * copy_price
                             spent = self.tracker.get_market_spend(wallet, condition_id)
+                            new_cost = copy_size * copy_price
                             if side == "BUY" and spent + new_cost > max_market_usdc:
-                                log.info(
-                                    "Min size=%.0f custaria $%.2f, estoura limite (gasto=%.2f max=%.2f), pulando",
-                                    min_size, new_cost, spent, max_market_usdc
-                                )
+                                log.info("Min size=%.0f estoura limite, pulando", min_size)
                                 self.tracker.record_skip()
                                 return None
-                            log.info(
-                                "Min size do mercado = %.2f, retentando com size ajustado",
-                                min_size
+                            order_args = OrderArgs(
+                                price=copy_price, size=copy_size,
+                                side=clob_side, token_id=token_id,
                             )
-                            continue
-                    # Parsear min notional: "min size: $1"
-                    if "min size:" in err_msg and attempt == 0:
-                        import re
-                        match = re.search(r"min size:\s*\$?(\d+\.?\d*)", err_msg)
+                            signed_order = self.client.create_order(order_args)
+                            resp = self.client.post_order(signed_order, OrderType.GTC)
+                            order_type_used = "GTC-retry"
+                        else:
+                            raise
+                    elif "min size:" in gtc_msg:
+                        match = re.search(r"min size:\s*\$?(\d+\.?\d*)", gtc_msg)
                         if match:
                             min_notional = float(match.group(1))
                             copy_size = round(min_notional / copy_price + 0.1, 2)
-                            # Revalidar max_market
-                            new_cost = copy_size * copy_price
                             spent = self.tracker.get_market_spend(wallet, condition_id)
-                            if side == "BUY" and spent + new_cost > max_market_usdc:
-                                log.info(
-                                    "Min notional ajuste custaria $%.2f, estoura limite, pulando",
-                                    new_cost
-                                )
+                            if side == "BUY" and spent + copy_size * copy_price > max_market_usdc:
                                 self.tracker.record_skip()
                                 return None
-                            log.info(
-                                "Min notional = $%.2f, retentando com size %.2f",
-                                min_notional, copy_size
+                            order_args = OrderArgs(
+                                price=copy_price, size=copy_size,
+                                side=clob_side, token_id=token_id,
                             )
-                            continue
-                    raise  # re-raise se nao e min size ou ja tentou
+                            signed_order = self.client.create_order(order_args)
+                            resp = self.client.post_order(signed_order, OrderType.GTC)
+                            order_type_used = "GTC-notional"
+                        else:
+                            raise
+                    else:
+                        raise
+
+            if resp is None:
+                log.error("Nenhuma ordem executada")
+                self.tracker.record_error()
+                return None
 
             order_id = ""
             if isinstance(resp, dict):
@@ -331,7 +371,7 @@ class OrderExecutor:
             else:
                 order_id = str(resp)
 
-            log.info("[LIVE] Ordem postada: %s | resp=%s", side, order_id)
+            log.info("[LIVE] Ordem postada [%s]: %s | resp=%s", order_type_used, side, order_id)
 
             self.tracker.record_trade({
                 "token_id": token_id,

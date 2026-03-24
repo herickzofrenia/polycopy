@@ -181,3 +181,29 @@ class PositionTracker:
                 "uptime_hours": round(hours, 2),
                 "trades_per_hour": round(self.total_copied / max(hours, 0.01), 2),
             }
+
+    def get_trades_by_wallet(self, wallet_label, limit=50):
+        """Retorna trades filtrados por wallet."""
+        with self._lock:
+            filtered = [t for t in self.trades if t.get("wallet_source") == wallet_label]
+            return list(reversed(filtered[-limit:]))
+
+    def get_positions_by_wallet(self, wallet_label):
+        """Retorna posicoes filtradas por wallet."""
+        with self._lock:
+            return {k: v for k, v in self.positions.items()
+                    if v.get("wallet_source") == wallet_label}
+
+    def get_wallet_stats(self, wallet_label):
+        """Retorna stats de uma wallet especifica."""
+        with self._lock:
+            trades = [t for t in self.trades if t.get("wallet_source") == wallet_label]
+            positions = {k: v for k, v in self.positions.items()
+                         if v.get("wallet_source") == wallet_label}
+            total_spent = sum(t.get("price", 0) * t.get("size", 0)
+                              for t in trades if t.get("side") == "BUY")
+            return {
+                "total_trades": len(trades),
+                "open_positions": len(positions),
+                "total_spent_usdc": round(total_spent, 2),
+            }

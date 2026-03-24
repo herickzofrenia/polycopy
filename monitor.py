@@ -140,6 +140,9 @@ class WalletMonitor:
                     if self.dedup.seen(dedup_key):
                         continue
 
+                    # Marcar keys alternativas pra evitar duplicacao com WS
+                    self._mark_dedup_extras(trade)
+
                     self._update_status(
                         label,
                         trades_detected=self._wallet_status.get(label, {}).get("trades_detected", 0) + 1,
@@ -191,6 +194,17 @@ class WalletMonitor:
         timestamp = str(trade.get("timestamp", trade.get("createdAt", "")))
         side = trade.get("side", trade.get("type", ""))
         return f"{tx_hash}:{timestamp}:{side}"
+
+    def _mark_dedup_extras(self, trade):
+        """Marca keys alternativas no dedup pra evitar duplicacao WS/polling."""
+        tx_hash = trade.get("transactionHash", trade.get("transaction_hash", ""))
+        timestamp = str(trade.get("timestamp", trade.get("createdAt", "")))
+        side = trade.get("side", trade.get("type", ""))
+        asset = str(trade.get("asset", trade.get("tokenId", "")))
+        if tx_hash:
+            self.dedup.seen(f"tx:{tx_hash}")
+        if asset and timestamp:
+            self.dedup.seen(f"{asset}:{timestamp}:{side}")
 
     def _process_new_trade(self, trade, wallet_cfg):
         """Processa um trade novo detectado."""

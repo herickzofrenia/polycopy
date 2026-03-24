@@ -1,0 +1,31 @@
+{
+  "copy_size_usdc": 1.0,
+  "max_slippage_pct": 2,
+  "max_open_positions": 20,
+  "poll_interval": 2,
+  "copy_mode": "FIXED",
+  "copy_multiplier": 1.0,
+  "my_bankroll": 50.0,
+  "wallets": {
+    "Wallet-1": {
+      "price_min": 0.5,
+      "price_max": 0.98,
+      "max_market_usdc": -2.0
+    },
+    "Wallet-2": {
+      "price_min": 0.5,
+      "price_max": 0.98,
+      "max_market_usdc": 10.0
+    },
+    "Wallet-3": {
+      "price_min": 0.5,
+      "price_max": 0.98,
+      "max_market_usdc": 6.0
+    },
+    "Wallet-4": {
+      "price_min": 0.4,
+      "price_max": 0.98,
+      "max_market_usdc": 25.0
+    }
+  }
+}

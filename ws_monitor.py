@@ -164,18 +164,30 @@ class WSTradeMonitor:
         wallet_cfg = self._wallet_map[wallet_addr]
         label = wallet_cfg["label"]
 
-        # Dedup
+        # Dedup - usar multiplas keys pra garantir que WS e polling nao dupliquem
         tx_hash = trade.get("transactionHash", trade.get("transaction_hash", ""))
         timestamp = str(trade.get("timestamp", trade.get("createdAt", "")))
         side = trade.get("side", trade.get("type", ""))
+        asset = str(trade.get("asset", trade.get("tokenId", "")))
+
+        # Key completa
         dedup_key = f"{tx_hash}:{timestamp}:{side}"
+        # Key so por tx_hash (pra casar com polling que pode ter timestamp diferente)
+        dedup_key_tx = f"tx:{tx_hash}" if tx_hash else ""
+        # Key por asset+timestamp+side (pra casar quando tx_hash vem diferente)
+        dedup_key_asset = f"{asset}:{timestamp}:{side}" if asset and timestamp else ""
 
         if not dedup_key or dedup_key == "::":
-            # Sem dados suficientes pra dedup, gerar key alternativa
             dedup_key = f"ws:{wallet_addr}:{json.dumps(trade, sort_keys=True)[:100]}"
 
+        # Checar se qualquer variacao ja foi vista
         if self.dedup.seen(dedup_key):
             return
+        # Tambem marcar as keys alternativas como vistas
+        if dedup_key_tx:
+            self.dedup.seen(dedup_key_tx)
+        if dedup_key_asset:
+            self.dedup.seen(dedup_key_asset)
 
         log.info("[WS][%s] Trade detectado via WebSocket!", label)
         self._process_new_trade(trade, wallet_cfg)
